@@ -6,7 +6,12 @@ with its win rate in every archetype.
 
 **Live site:** https://xioshiva.github.io/archetype-synergy-map/
 
-To update the site, rebuild into `docs/` (GitHub Pages serves that folder from `main`), then commit and push:
+The site rebuilds itself every day at 06:17 UTC with fresh 17Lands data
+([`.github/workflows/update-site.yml`](.github/workflows/update-site.yml)). To change which sets
+it builds, edit `SETS` there. You can also run it by hand from the repo's **Actions** tab
+("Update site" → "Run workflow"), choosing the sets and time window.
+
+To update the site by hand, rebuild into `docs/` (GitHub Pages serves that folder from `main`), then commit and push:
 
 ```bash
 py synergy_map.py TRK --period LAST_WEEK --no-png --out-dir docs
