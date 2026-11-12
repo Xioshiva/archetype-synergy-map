@@ -108,7 +108,8 @@ def card_rates(set_code, fmt, period, fresh, colors=None):
             wr, est = estimate_gih(r), True
         if r.get("name") and wr is not None:
             out[r["name"]] = {"wr": wr, "games": n, "color": r.get("color") or "",
-                              "rarity": r.get("rarity", ""), "est": est}
+                              "rarity": r.get("rarity", ""), "est": est,
+                              "img": r.get("url") or None}
     return out
 
 
@@ -136,26 +137,84 @@ def _safe(name: str) -> str:
     return re.sub(r"[^\w\- ]", "_", name)
 
 
-def scryfall_images(name: str, set_code: str) -> dict | None:
-    """{'small': url, 'normal': url} for a card, cached on disk."""
+_IMAGES: dict[str, dict] = {}  # name -> {'small': url, 'normal': url}, from load_images()
+
+
+def _scryfall_post(identifiers: list[dict]) -> dict:
+    """POST /cards/collection, retrying when Scryfall rate-limits us."""
+    for attempt in range(6):
+        resp = requests.post("https://api.scryfall.com/cards/collection",
+                             json={"identifiers": identifiers}, headers=HEADERS, timeout=60)
+        time.sleep(0.2)  # Scryfall asks for well under 10 requests/second
+        if resp.status_code == 429 or resp.status_code >= 500:
+            time.sleep(2 ** attempt)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    return {"data": [], "not_found": identifiers}
+
+
+def _uris(card: dict) -> dict | None:
+    uris = card.get("image_uris") or (card.get("card_faces") or [{}])[0].get("image_uris")
+    return {"small": uris["small"], "normal": uris["normal"]} if uris else None
+
+
+def load_images(names, set_code: str, fallback: dict[str, str | None]) -> int:
+    """Look up card images on Scryfall, 75 cards per request, cached on disk.
+
+    Only successful lookups are cached, so a bad run never sticks. Cards Scryfall
+    can't find fall back to the 17Lands card image. Returns how many have none.
+    """
     d = CACHE / "scryfall" / set_code
     d.mkdir(parents=True, exist_ok=True)
-    path = d / f"{_safe(name)}.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8")) or None
-    info = None
-    for params in ({"exact": name, "set": set_code.lower()}, {"exact": name}):
-        resp = requests.get("https://api.scryfall.com/cards/named", params=params,
-                            headers=HEADERS, timeout=30)
-        time.sleep(0.1)  # Scryfall asks for <= 10 requests/second
-        if resp.ok:
-            card = resp.json()
-            uris = card.get("image_uris") or (card.get("card_faces") or [{}])[0].get("image_uris")
-            if uris:
-                info = {"small": uris["small"], "normal": uris["normal"]}
-            break
-    path.write_text(json.dumps(info), encoding="utf-8")
-    return info
+    missing = []
+    for name in names:
+        path = d / f"{_safe(name)}.json"
+        info = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        if info:
+            _IMAGES[name] = info
+        else:
+            missing.append(name)
+
+    def lookup(batch: list[str], with_set: bool) -> list[str]:
+        ids = [{"name": n, "set": set_code.lower()} if with_set else {"name": n} for n in batch]
+        res = _scryfall_post(ids)
+        found = {}
+        for card in res.get("data", []):
+            info = _uris(card)
+            if not info:
+                continue
+            # Match on the full name and on each face ("A // B", "A", "B").
+            for key in [card["name"], *[f["name"] for f in card.get("card_faces", [])]]:
+                found.setdefault(key, info)
+        still = []
+        for n in batch:
+            info = found.get(n) or found.get(n.split(" // ")[0])
+            if info:
+                _IMAGES[n] = info
+                (d / f"{_safe(n)}.json").write_text(json.dumps(info), encoding="utf-8")
+            else:
+                still.append(n)
+        return still
+
+    for i in range(0, len(missing), 75):
+        batch = lookup(missing[i:i + 75], with_set=True)
+        if batch:  # e.g. guest cards printed in another set
+            lookup(batch, with_set=False)
+
+    none = 0
+    for name in names:
+        if name not in _IMAGES:
+            if fallback.get(name):
+                _IMAGES[name] = {"small": fallback[name], "normal": fallback[name]}
+            else:
+                none += 1
+    return none
+
+
+def scryfall_images(name: str, set_code: str) -> dict | None:
+    """{'small': url, 'normal': url} for a card (after load_images)."""
+    return _IMAGES.get(name)
 
 
 def card_image(name: str, set_code: str):
@@ -329,7 +388,9 @@ h2 { font-size:17px; margin:0 }
 .pip { width:11px; height:11px; border-radius:50%; border:1px solid rgba(0,0,0,.35) }
 .reset { border:0; background:none; color:var(--accent); font:inherit; font-size:12.5px; cursor:pointer }
 .count { font-size:12px; color:var(--muted) }
-.dot { aspect-ratio:1; border-radius:50%; font-size:0 }
+.dot { aspect-ratio:63/88; background:#3a3c42 !important; color:#eee; font-size:9px;
+       line-height:1.15; padding:3px; overflow:hidden; display:flex; align-items:center;
+       justify-content:center; text-align:center }
 .modal { position:fixed; inset:0; background:rgba(0,0,0,.72); display:none;
          align-items:center; justify-content:center; padding:16px; z-index:100000 }
 .modal.open { display:flex }
@@ -464,7 +525,7 @@ function render(id) {
     b.dataset.color = colorGroup(p.c); b.dataset.rarity = p.r;
     Object.assign(b.style, {left: X(p.x) + '%', top: Y(p.y) + '%', width: w + '%', zIndex: 10 + i});
     if (p.s) { const im = new Image(); im.src = p.s; im.alt = p.n; im.loading = 'lazy'; b.appendChild(im); }
-    else b.style.background = '#888';
+    else b.textContent = p.n;
     b.onclick = () => openCard(p, ch);
     plot.appendChild(b);
   });
@@ -559,6 +620,12 @@ def main():
         for cname, c in cards.items():
             if c["games"] >= min_arch_games and fits(c["color"], short):
                 arch_stats.setdefault(cname, {})[short] = [c["wr"], c["games"], c["est"]]
+
+    names = set(overall) | {n for cards in per_arch.values() for n in cards}
+    fallback = {n: c["img"] for cards in [overall, *per_arch.values()]
+                for n, c in cards.items() if c.get("img")}
+    no_img = load_images(sorted(names), s, fallback)
+    print(f"  Card images: {len(names) - no_img} of {len(names)} found")
 
     charts = [global_chart(overall, arch_stats, fmt_avg, a.min_games, s)]
     print(f"  All cards: {len(charts[0]['points'])} cards plotted")
